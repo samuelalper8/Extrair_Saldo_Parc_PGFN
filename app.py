@@ -9,9 +9,9 @@ from datetime import datetime
 from PIL import Image
 
 # --- CONFIGURAÇÃO ---
-st.set_page_config(page_title="Extrator PGFN Completo", page_icon="📊", layout="wide")
+st.set_page_config(page_title="Extrator PGFN Multilinha", page_icon="📜", layout="wide")
 
-# --- FUNÇÕES DE TEXTO E REGEX ---
+# --- FUNÇÕES ---
 
 def parse_currency(value_str):
     if not value_str: return 0.0
@@ -23,75 +23,109 @@ def parse_currency(value_str):
     except:
         return 0.0
 
-def encontrar_melhor_saldo(text):
-    """Busca o saldo final com prioridade para Saldo Devedor."""
+def encontrar_saldo_blindado(text):
+    """Busca saldo com heurística de OCR e valores máximos."""
     patterns = [
         (r"Saldo\s*Devedor\s*com\s*Juros.*?(?:R\$)?\s*([\d\.]+,\d{2})", "Saldo Devedor c/ Juros"),
         (r"Valor\s*total\s*consolidado.*?(?:R\$)?\s*([\d\.]+,\d{2})", "Vlr Total Consolidado"),
         (r"Total\s*Geral.*?(?:R\$)?\s*([\d\.]+,\d{2})", "Total Geral"),
         (r"Total:.*?(?:R\$)?\s*([\d\.]+,\d{2})", "Total (Tabela)"),
         (r"(?:Saldo\s*Devedor|Valor\s*Consolidado).*?(?:R\$)?\s*([\d\.]+,\d{2})", "Saldo/Consolidado Genérico"),
-        (r"\bTotal\b\s*[\.\:_]*\s*(?:R\$)?\s*([\d\.]+,\d{2})", "Total Simples")
+        (r"Total.*?(?:R\$)?.*?([\d\.]+,\d{2})", "Total OCR") 
     ]
-    for pat, nome_metodo in patterns:
+    
+    cand = []
+    for pat, nome in patterns:
         matches = re.findall(pat, text, re.IGNORECASE | re.DOTALL)
-        if matches:
-            valores = [parse_currency(m) for m in matches]
-            valores = [v for v in valores if v > 0]
-            if valores: return max(valores), nome_metodo
+        for m in matches:
+            v = parse_currency(m)
+            if v > 100:
+                cand.append((v, nome))
+    
+    if cand:
+        return max(cand, key=lambda item: item[0])
+    
     return 0.0, "Não encontrado"
 
-def extrair_identificador_focado(text):
-    """Foca no Número da Negociação (7 dígitos)."""
-    match_7dig = re.search(r"Negociaç[ãa]o.*?(\d{7})(?!\d)", text, re.IGNORECASE)
-    if match_7dig: return match_7dig.group(1), "Negociação (7 dígitos)"
-
-    match_neg_gen = re.search(r"Negociaç[ãa]o[:\s№º\.]*(\d+)", text, re.IGNORECASE)
-    if match_neg_gen: return match_neg_gen.group(1), "Negociação (Genérica)"
+def extrair_identificador_inteligente(text):
+    """Tenta achar Negociação/Inscrição mesmo com OCR ruim."""
+    match_7 = re.search(r"(?:Negoc|Parcel|Conta).*?(\d{7})(?!\d)", text, re.IGNORECASE)
+    if match_7: return match_7.group(1), "Negociação (7 dig)"
     
-    match_insc = re.search(r"Inscriç[ãa]o[:\s№º\.]*([\d\s\.\/-]+)", text, re.IGNORECASE)
-    if match_insc: return match_insc.group(1).strip(), "Inscrição"
+    match_insc = re.search(r"(\d{2}\s*\d\s*\d{2}\s*\d{6}[-\s]\d{2})", text)
+    if match_insc: return match_insc.group(1).replace("\n", ""), "Inscrição"
+
+    match_gen = re.search(r"(?:Negocia|Inscricao).*?[:\.]\s*(\d+)", text, re.IGNORECASE)
+    if match_gen: return match_gen.group(1), "Genérico"
     
     return "Desconhecido", "-"
 
-def extrair_modalidade(text):
+def inferir_modalidade(text, raw_modalidade=""):
     """
-    Identifica o tipo de dívida ou parcelamento.
+    Refina a modalidade capturada ou adivinha pelo contexto se estiver vazia/ruim.
     """
-    # 1. Tenta capturar o campo explícito "Modalidade:" (Comum no SISPAR)
-    # Pega tudo até a quebra de linha
-    match_mod = re.search(r"Modalidade[:\s\.]*(.*?)(?:\n|$)", text, re.IGNORECASE)
-    if match_mod:
-        valor = match_mod.group(1).strip()
-        # Filtra se pegou lixo ou texto muito curto
-        if len(valor) > 3 and "DATA" not in valor.upper():
-            return valor
+    # Se capturou algo, limpa as quebras de linha para ficar numa linha só
+    if raw_modalidade:
+        raw_modalidade = raw_modalidade.replace("\n", " ").strip()
+        # Remove lixo comum de OCR no final (ex: início do próximo campo)
+        raw_modalidade = re.split(r"(?:Data|Situa|Valor|N[º°])", raw_modalidade, flags=re.IGNORECASE)[0]
+    
+    # Se o texto capturado for inútil ("Tipo de", "Modalidade"), ignora
+    if len(raw_modalidade) < 5 or "TIPO DE" in raw_modalidade.upper():
+        raw_modalidade = ""
+    
+    # Se temos um texto decente, retorna ele
+    if len(raw_modalidade) > 10:
+        return raw_modalidade.strip()
 
-    # 2. Tenta capturar "Receita da Dívida" (Comum no Regularize)
-    match_rec = re.search(r"Receita da dívida[:\s\.]*(.*?)(?:\n|$)", text, re.IGNORECASE)
-    if match_rec:
-        return match_rec.group(1).strip()
-
-    # 3. Busca por Palavras-Chave (Heurística)
+    # Se falhou, tenta inferir pelo texto completo do documento
     upper = text.upper()
+    mapa = {
+        "EC 113": "Parcelamento EC 113",
+        "EC113": "Parcelamento EC 113",
+        "13.485": "PERT (Lei 13.485)",
+        "TRANSACAO EXCEPCIONAL": "Transação Excepcional",
+        "EXTRAORDINARIA": "Transação Extraordinária",
+        "DIVIDA ATIVA": "Dívida Ativa",
+        "SIMPLES NACIONAL": "Simples Nacional",
+        "SISPAR": "Parcelamento SISPAR",
+        "PREVIDENCIARIO": "Previdenciário (Geral)"
+    }
     
-    if "TRANSACAO EXCEPCIONAL" in upper or "TRANSAÇÃO EXCEPCIONAL" in upper:
-        return "Transação Excepcional"
-    if "EC 113" in upper or "EC113" in upper:
-        return "Parcelamento EC 113"
-    if "13.485" in upper:
-        return "PERT (Lei 13.485)"
-    if "SIMPLES NACIONAL" in upper:
-        return "Simples Nacional"
-    if "DIVIDA ATIVA" in upper or "DÍVIDA ATIVA" in upper:
-        return "Dívida Ativa (Geral)"
-    if "SISPAR" in upper:
-        return "Parcelamento SISPAR"
-    
+    for key, val in mapa.items():
+        if key in upper:
+            return val
+            
     return "Não Identificada"
 
-# --- ENGINE OCR ---
+def extrair_modalidade_multilinha(text):
+    """
+    Captura o texto da Modalidade/Receita permitindo múltiplas linhas.
+    Para apenas quando encontra uma 'Stop Word' (próximo campo).
+    """
+    # Lista de palavras que indicam o INÍCIO do PRÓXIMO campo
+    # Se o regex encontrar isso, ele para de capturar.
+    stop_words = r"(?:Situa|Data|Valor|N[º°]|Inscri|Natureza|Receita|Quant)"
+    
+    # 1. Padrão SISPAR: "Modalidade: ..... (para no próximo campo)"
+    # (?s) ativa o DOTALL (ponto pega quebra de linha)
+    match_mod = re.search(r"Modalidade[:\s\.]*(.*?)(?=\n\s*" + stop_words + r"|$)", text, re.IGNORECASE | re.DOTALL)
+    if match_mod:
+        return match_mod.group(1).strip()
+    
+    # 2. Padrão Regularize: "Receita da dívida: ....."
+    match_rec = re.search(r"Receita da dívida[:\s\.]*(.*?)(?=\n\s*" + stop_words + r"|$)", text, re.IGNORECASE | re.DOTALL)
+    if match_rec:
+        return match_rec.group(1).strip()
+    
+    # 3. Fallback: "Descrição: ...."
+    match_desc = re.search(r"Descriç[:\s\.]*(.*?)(?=\n\s*" + stop_words + r"|$)", text, re.IGNORECASE | re.DOTALL)
+    if match_desc:
+        return match_desc.group(1).strip()
+    
+    return ""
 
+# --- ENGINE OCR ---
 def aplicar_ocr(pdf_bytes):
     try:
         images = convert_from_bytes(pdf_bytes, dpi=300)
@@ -100,79 +134,66 @@ def aplicar_ocr(pdf_bytes):
             text = pytesseract.image_to_string(img, lang='por')
             full_text += text + "\n"
         return full_text
-    except:
-        return ""
+    except: return ""
 
-def processar_arquivo(uploaded_file):
+def processar(uploaded_file):
     filename = uploaded_file.name
-    metodo_leitura = "Texto Nativo"
+    metodo = "Texto Nativo"
     pdf_bytes = uploaded_file.read()
     
-    # 1. Leitura
     full_text = ""
     try:
         with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
             for page in doc: full_text += page.get_text() + "\n"
     except: pass
 
-    # 2. OCR se necessário
     if len(full_text.strip()) < 50:
-        metodo_leitura = "OCR (Imagem)"
-        with st.status(f"Lendo {filename} com OCR...", expanded=True):
+        metodo = "OCR (Imagem)"
+        with st.status(f"Processando {filename}...", expanded=True):
             full_text = aplicar_ocr(pdf_bytes)
     
-    # 3. Extração
-    identificador, tipo_id = extrair_identificador_focado(full_text)
-    saldo, metodo_saldo = encontrar_melhor_saldo(full_text)
-    modalidade = extrair_modalidade(full_text)
+    identificador, tipo_id = extrair_identificador_inteligente(full_text)
+    saldo, metodo_saldo = encontrar_saldo_blindado(full_text)
+    
+    # Extração Multilinha
+    raw_mod = extrair_modalidade_multilinha(full_text)
+    modalidade_final = inferir_modalidade(full_text, raw_mod)
     
     return {
         "Arquivo": filename,
         "Identificador": identificador,
-        "Modalidade": modalidade,  # Nova Coluna
+        "Modalidade": modalidade_final,
         "Saldo (R$)": saldo,
-        "Método Leitura": metodo_leitura
+        "Método Leitura": metodo
     }
 
 # --- INTERFACE ---
-
-st.title("📊 Extrator PGFN (Negociação + Modalidade)")
-st.markdown("Extrai **Identificador**, **Modalidade** e **Saldo Final** dos extratos.")
+st.title("📜 Extrator PGFN Multilinha")
+st.markdown("Extração ajustada para textos de Modalidade que quebram linha.")
 
 arquivos = st.file_uploader("Arraste seus PDFs", type=["pdf"], accept_multiple_files=True)
 
 if arquivos:
-    if st.button("Processar Extratos"):
+    if st.button("Processar"):
         dados = []
         bar = st.progress(0)
         
         for i, arq in enumerate(arquivos):
-            res = processar_arquivo(arq)
+            res = processar(arq)
             dados.append(res)
-            bar.progress((i + 1) / len(arquivos))
-        
+            bar.progress((i+1)/len(arquivos))
+            
         df = pd.DataFrame(dados)
+        st.success("Pronto!")
         
-        st.success("Processamento Finalizado!")
+        st.dataframe(df.style.format({"Saldo (R$)": "R$ {:,.2f}"}), use_container_width=True)
+        st.metric("Total", f"R$ {df['Saldo (R$)'].sum():,.2f}")
         
-        # Exibição
-        st.dataframe(
-            df.style.format({"Saldo (R$)": "R$ {:,.2f}"}),
-            use_container_width=True
-        )
-        
-        total = df["Saldo (R$)"].sum()
-        st.metric("Total Consolidado", f"R$ {total:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-
-        # Excel
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-            df.to_excel(writer, index=False, sheet_name="Extrato")
-            ws = writer.sheets["Extrato"]
-            fmt = writer.book.add_format({'num_format': '#,##0.00'})
-            ws.set_column('D:D', 18, fmt) # Saldo
-            ws.set_column('C:C', 35)      # Modalidade (Mais largo)
-            ws.set_column('B:B', 20)      # Identificador
-            ws.set_column('A:A', 25)      # Arquivo
-        
-        st.download_button("⬇️ Baixar Excel", buffer.getvalue(), f"Extrato_Modalidades_{datetime.now().strftime('%H%M')}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            df.to_excel(writer, index=False)
+            ws = writer.sheets['Sheet1']
+            ws.set_column('C:C', 50) # Coluna Modalidade bem larga
+            ws.set_column('D:D', 18)
+            
+        st.download_button("Baixar Excel", buffer.getvalue(), f"PGFN_Multilinha_{datetime.now().strftime('%H%M')}.xlsx")
