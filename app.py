@@ -3,172 +3,170 @@ import pandas as pd
 import fitz  # PyMuPDF
 import re
 import io
+import pytesseract
+from pdf2image import convert_from_bytes
 from datetime import datetime
+from PIL import Image
 
 # --- CONFIGURAÇÃO ---
-st.set_page_config(page_title="Extrator Universal PGFN", page_icon="🚜", layout="wide")
+st.set_page_config(page_title="Extrator OCR PGFN", page_icon="👁️", layout="wide")
 
-# --- FUNÇÕES DE AJUDA ---
+# --- FUNÇÕES DE TEXTO E REGEX ---
 
 def parse_currency(value_str):
-    """Transforma strings numéricas BR (1.000,00) em float (1000.00)."""
     if not value_str: return 0.0
     try:
-        # Remove R$, espaços e caracteres invisíveis
-        clean = re.sub(r'[^\d,\.]', '', str(value_str))
-        # Remove pontos de milhar e troca vírgula decimal por ponto
+        # Limpa sujeira comum de OCR (ex: trocar 'S' por '5', '.' por ',')
+        clean = str(value_str).replace(" ", "").replace("R$", "")
+        # Remove caracteres não numéricos exceto vírgula e ponto
+        clean = re.sub(r'[^\d,\.]', '', clean)
+        # Padroniza para float
         clean = clean.replace(".", "").replace(",", ".")
         return float(clean)
     except:
         return 0.0
 
 def encontrar_melhor_saldo(text):
-    """
-    Tenta encontrar o saldo final usando várias estratégias de regex,
-    ordenadas por confiabilidade (do mais específico para o mais genérico).
-    """
-    val = 0.0
-    metodo = "Não encontrado"
-    
-    # Lista de padrões (Regex) e seus pesos/confiabilidade
-    # O padrão procura a chave e pega o valor monetário que estiver na mesma linha ou logo depois
+    """Lógica 'Blindada' aplicada ao texto (seja ele nativo ou OCR)."""
+    # Regex ajustadas para tolerar erros comuns de OCR (espaços extras, troca de letras)
     patterns = [
-        # Estratégia 1: SISPAR / Parcelamentos Especiais (Saldo Devedor com Juros é o que importa)
-        (r"Saldo Devedor com Juros.*?(?:R\$)?\s*([\d\.]+,\d{2})", "Saldo Devedor c/ Juros"),
-        
-        # Estratégia 2: Regularize / Extratos Detalhados (Valor Total Consolidado)
-        (r"Valor total consolidado.*?(?:R\$)?\s*([\d\.]+,\d{2})", "Vlr Total Consolidado"),
-        
-        # Estratégia 3: Tabelas de Parcelamento (Linha de Totais no rodapé)
-        # Procura "Total:" seguido de valor no final da linha
-        (r"\bTotal:.*?(?:R\$)?\s*([\d\.]+,\d{2})", "Total (Tabela)"),
-        
-        # Estratégia 4: EC 113 ou Transações (Saldo Devedor Total ou Consolidado)
-        (r"(?:Saldo Devedor|Valor Consolidado).*?(?:R\$)?\s*([\d\.]+,\d{2})", "Saldo/Consolidado Genérico"),
-        
-        # Estratégia 5: Fallback para tabelas simples onde aparece apenas "Total"
-        (r"\bTotal\b.*?(?:R\$)?\s*([\d\.]+,\d{2})", "Total Simples")
+        (r"Saldo\s*Devedor\s*com\s*Juros.*?(?:R\$)?\s*([\d\.]+,\d{2})", "Saldo Devedor c/ Juros"),
+        (r"Valor\s*total\s*consolidado.*?(?:R\$)?\s*([\d\.]+,\d{2})", "Vlr Total Consolidado"),
+        (r"Total\s*Geral.*?(?:R\$)?\s*([\d\.]+,\d{2})", "Total Geral"),
+        (r"Total:.*?(?:R\$)?\s*([\d\.]+,\d{2})", "Total (Tabela)"),
+        (r"(?:Saldo\s*Devedor|Valor\s*Consolidado).*?(?:R\$)?\s*([\d\.]+,\d{2})", "Saldo/Consolidado Genérico"),
+        # Fallback para OCR sujo que lê 'Total' solto
+        (r"\bTotal\b\s*[\.\:_]*\s*(?:R\$)?\s*([\d\.]+,\d{2})", "Total Simples")
     ]
 
     for pat, nome_metodo in patterns:
-        # re.IGNORECASE | re.DOTALL permite que o valor esteja na linha de baixo em alguns casos
         matches = re.findall(pat, text, re.IGNORECASE | re.DOTALL)
         if matches:
-            # Pega o último match encontrado (geralmente o total está no final do documento)
-            # ou o match que tiver o maior valor (heurística para evitar pegar parcelas)
             valores = [parse_currency(m) for m in matches]
-            # Filtra zeros
             valores = [v for v in valores if v > 0]
-            
             if valores:
-                # Assume o maior valor encontrado nesse padrão como o saldo (evita pegar valor de parcela)
-                melhor_valor = max(valores)
-                return melhor_valor, nome_metodo
+                return max(valores), nome_metodo
 
-    return 0.0, "Não identificado"
+    return 0.0, "Não encontrado"
 
 def extrair_identificador(text):
-    """Tenta identificar Inscrição, Negociação ou Processo."""
-    # 1. Negociação (Comum em EC 113 e Sispar)
-    match_neg = re.search(r"(?:Negociação|Conta|Parcelamento)[:\s№º]*(\d+)", text, re.IGNORECASE)
+    # Regex tolerante a OCR
+    match_neg = re.search(r"(?:Negociaç[ãa]o|Conta|Parcelamento)[:\s№º\.]*(\d+)", text, re.IGNORECASE)
     if match_neg: return match_neg.group(1), "Negociação"
     
-    # 2. Inscrição (Comum em Dívida Ativa)
-    match_insc = re.search(r"Inscrição[:\s№º]*([\d\s\.\/-]+)", text, re.IGNORECASE)
+    match_insc = re.search(r"Inscriç[ãa]o[:\s№º\.]*([\d\s\.\/-]+)", text, re.IGNORECASE)
     if match_insc: return match_insc.group(1).strip(), "Inscrição"
     
     return "Desconhecido", "-"
 
-def processar_pdf_universal(uploaded_file):
-    filename = uploaded_file.name
-    full_text = ""
-    
+# --- ENGINE OCR ---
+
+def aplicar_ocr(pdf_bytes):
+    """Converte PDF em Imagens e aplica OCR (Tesseract)."""
     try:
-        # Lê o PDF
-        with fitz.open(stream=uploaded_file.read(), filetype="pdf") as doc:
-            # Estratégia: Ler todas as páginas, pois em extratos EC 113 o total pode estar na pág 2 ou 3
+        # Converte páginas do PDF em imagens (300 DPI é ideal para leitura)
+        images = convert_from_bytes(pdf_bytes, dpi=300)
+        full_text = ""
+        
+        for img in images:
+            # lang='por' exige o tesseract-ocr-por no packages.txt
+            text = pytesseract.image_to_string(img, lang='por')
+            full_text += text + "\n"
+            
+        return full_text
+    except Exception as e:
+        st.error(f"Erro no OCR: {e}. Verifique se 'poppler-utils' e 'tesseract-ocr' estão instalados.")
+        return ""
+
+def processar_hibrido(uploaded_file):
+    filename = uploaded_file.name
+    metodo_leitura = "Texto Nativo"
+    
+    # Lê arquivo para bytes
+    pdf_bytes = uploaded_file.read()
+    
+    # 1. Tenta leitura rápida (PyMuPDF)
+    full_text = ""
+    try:
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
             for page in doc:
                 full_text += page.get_text() + "\n"
-        
-        # 1. Extrair Identificador
-        identificador, tipo_id = extrair_identificador(full_text)
-        
-        # 2. Extrair Saldo (Motor Inteligente)
-        saldo, metodo = encontrar_melhor_saldo(full_text)
-        
-        # 3. Identificar Tipo de Extrato (apenas para referência)
-        tipo_doc = "Genérico"
-        if "EC 113" in full_text or "EC113" in full_text: tipo_doc = "EC 113"
-        elif "TRANSAÇÃO" in full_text.upper(): tipo_doc = "Transação"
-        elif "13.485" in full_text: tipo_doc = "Lei 13.485"
-        elif "REGULARIZE" in full_text.upper(): tipo_doc = "Regularize"
+    except:
+        pass
 
-    except Exception as e:
-        return {
-            "Arquivo": filename,
-            "Tipo Doc": "Erro",
-            "Identificador": f"Erro: {str(e)}",
-            "Saldo (R$)": 0.0,
-            "Método": "Falha Leitura"
-        }
+    # 2. Decisão: Se o texto for muito curto ou vazio, o PDF é uma imagem -> Ativar OCR
+    # Limite arbitrário de 50 caracteres para considerar "Vazio/Escaneado"
+    if len(full_text.strip()) < 50:
+        metodo_leitura = "OCR (Imagem)"
+        with st.status(f"Aplicando OCR em {filename}... (Isso é mais lento)", expanded=True):
+            full_text = aplicar_ocr(pdf_bytes)
+    
+    # 3. Extração dos Dados (Mesma lógica blindada)
+    identificador, tipo_id = extrair_identificador(full_text)
+    saldo, metodo_extracao = encontrar_melhor_saldo(full_text)
+    
+    # Identificação do Tipo Doc
+    tipo_doc = "Genérico"
+    upper_text = full_text.upper()
+    if "EC 113" in upper_text or "EC113" in upper_text: tipo_doc = "EC 113"
+    elif "TRANSAÇÃO" in upper_text: tipo_doc = "Transação"
+    elif "REGULARIZE" in upper_text: tipo_doc = "Regularize"
 
     return {
         "Arquivo": filename,
+        "Leitura": metodo_leitura,
         "Tipo Doc": tipo_doc,
         "Identificador": identificador,
         "Saldo (R$)": saldo,
-        "Método": metodo
+        "Método Extração": metodo_extracao
     }
 
 # --- INTERFACE ---
 
-st.title("🚜 Extrator Universal de Parcelamentos (PGFN)")
+st.title("👁️ Extrator Híbrido com OCR")
 st.markdown("""
-**Versão 3.0 (Blindada)** - Projetada para ler:
-* ✅ EC 113
-* ✅ Transação Excepcional
-* ✅ Lei 13.485
-* ✅ Regularize Comum
+Esta versão detecta automaticamente se o PDF é texto ou imagem (escaneado).
+* **Texto Nativo:** Processamento instantâneo.
+* **Imagem (OCR):** Demora alguns segundos por página para ler o conteúdo.
 """)
 
-arquivos = st.file_uploader("Arraste TODOS os PDFs (Misturados)", type=["pdf"], accept_multiple_files=True)
+arquivos = st.file_uploader("Arraste seus PDFs", type=["pdf"], accept_multiple_files=True)
 
 if arquivos:
-    if st.button("Extrair Dados"):
-        with st.spinner("Escaneando documentos..."):
-            dados = []
-            prog = st.progress(0)
-            
-            for i, arq in enumerate(arquivos):
-                res = processar_pdf_universal(arq)
-                dados.append(res)
-                prog.progress((i + 1) / len(arquivos))
-            
-            df = pd.DataFrame(dados)
-            
-            st.success("Extração Concluída!")
-            
-            # Formatação visual
-            st.dataframe(
-                df.style.format({"Saldo (R$)": "R$ {:,.2f}"}), 
-                use_container_width=True
-            )
-            
-            # Total
-            total = df["Saldo (R$)"].sum()
-            col1, col2 = st.columns(2)
-            col1.metric("Total dos Saldos", f"R$ {total:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-            col2.info("Verifique a coluna 'Método' para confirmar como o valor foi encontrado.")
+    if st.button("Iniciar Processamento Inteligente"):
+        dados = []
+        prog = st.progress(0)
+        
+        for i, arq in enumerate(arquivos):
+            res = processar_hibrido(arq)
+            dados.append(res)
+            prog.progress((i + 1) / len(arquivos))
+        
+        df = pd.DataFrame(dados)
+        
+        st.success("Concluído!")
+        
+        # Exibe tabela formatada
+        st.dataframe(
+            df.style.format({"Saldo (R$)": "R$ {:,.2f}"}),
+            use_container_width=True
+        )
+        
+        # Métricas
+        total = df["Saldo (R$)"].sum()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total", f"R$ {total:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+        c2.metric("Lidos via OCR", len(df[df["Leitura"] == "OCR (Imagem)"]))
+        c3.metric("Lidos via Texto", len(df[df["Leitura"] == "Texto Nativo"]))
 
-            # Download
-            buffer = io.BytesIO()
-            with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                df.to_excel(writer, index=False, sheet_name="Saldos")
-                wb = writer.book
-                ws = writer.sheets["Saldos"]
-                fmt = wb.add_format({'num_format': '#,##0.00'})
-                ws.set_column('D:D', 18, fmt)
-                ws.set_column('A:A', 30)
-                ws.set_column('C:C', 20)
-            
-            st.download_button("⬇️ Baixar Excel", buffer.getvalue(), f"Saldos_V3_{datetime.now().strftime('%H%M')}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        # Download
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+            df.to_excel(writer, index=False, sheet_name="Dados")
+            ws = writer.sheets["Dados"]
+            wb = writer.book
+            fmt = wb.add_format({'num_format': '#,##0.00'})
+            ws.set_column('E:E', 18, fmt) # Coluna Saldo
+            ws.set_column('A:A', 30)
+        
+        st.download_button("⬇️ Baixar Excel", buffer.getvalue(), f"OCR_PGFN_{datetime.now().strftime('%H%M')}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
