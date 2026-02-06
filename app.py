@@ -9,13 +9,14 @@ from datetime import datetime
 from PIL import Image
 
 # --- CONFIGURAÇÃO ---
-st.set_page_config(page_title="Extrator PGFN Detalhado", page_icon="📝", layout="wide")
+st.set_page_config(page_title="Extrator PGFN 100%", page_icon="⭐", layout="wide")
 
 # --- FUNÇÕES ---
 
 def parse_currency(value_str):
     if not value_str: return 0.0
     try:
+        # Limpa sujeira e padroniza
         clean = str(value_str).replace(" ", "").replace("R$", "")
         clean = re.sub(r'[^\d,\.]', '', clean)
         clean = clean.replace(".", "").replace(",", ".")
@@ -24,78 +25,81 @@ def parse_currency(value_str):
         return 0.0
 
 def encontrar_saldo_blindado(text):
+    """
+    Busca o saldo com Prioridade Absoluta para o padrão SISPAR (Sonora).
+    """
+    # Lista de padrões em ordem de PRECEDÊNCIA (O primeiro que achar válido, leva)
     patterns = [
-        (r"Saldo\s*Devedor\s*com\s*Juros.*?(?:R\$)?\s*([\d\.]+,\d{2})", "Saldo Devedor c/ Juros"),
+        # 1. Padrão Ouro SISPAR: "Saldo Devedor com Juros" (Pega mesmo com quebra de linha ou abrev.)
+        # Ex: "Saldo Devedor com Juros: 100.000,00"
+        (r"Saldo\s*Devedor\s*c(?:om|/)\s*Juros.*?(?:R\$)?\s*([\d\.]+,\d{2})", "Saldo Devedor c/ Juros"),
+        
+        # 2. Padrão Regularize: "Valor total consolidado" (Rodapé azul)
         (r"Valor\s*total\s*consolidado.*?(?:R\$)?\s*([\d\.]+,\d{2})", "Vlr Total Consolidado"),
+        
+        # 3. Padrão Genérico Forte: "Total Geral"
         (r"Total\s*Geral.*?(?:R\$)?\s*([\d\.]+,\d{2})", "Total Geral"),
+        
+        # 4. Fallbacks para tabelas OCR e outros
         (r"Total:.*?(?:R\$)?\s*([\d\.]+,\d{2})", "Total (Tabela)"),
         (r"(?:Saldo\s*Devedor|Valor\s*Consolidado).*?(?:R\$)?\s*([\d\.]+,\d{2})", "Saldo/Consolidado Genérico"),
+        
+        # 5. Último recurso: Procura "Total" no fim da linha com valor grande
         (r"Total.*?(?:R\$)?.*?([\d\.]+,\d{2})", "Total OCR") 
     ]
-    cand = []
+    
+    # Varre os padrões. Se achar um valor > 0 no padrão de alta prioridade, retorna na hora.
     for pat, nome in patterns:
         matches = re.findall(pat, text, re.IGNORECASE | re.DOTALL)
+        # Filtra matches válidos
+        valores_validos = []
         for m in matches:
             v = parse_currency(m)
-            if v > 100: cand.append((v, nome))
-    if cand: return max(cand, key=lambda item: item[0])
+            if v > 100: # Ignora valores irrisórios/lixo
+                valores_validos.append(v)
+        
+        if valores_validos:
+            # Retorna o maior valor encontrado DENTRO deste padrão prioritário
+            return max(valores_validos), nome
+            
     return 0.0, "Não encontrado"
 
 def extrair_identificadores_completos(text):
-    """
-    Captura TANTO a Negociação QUANTO as Inscrições/Débitos inclusos.
-    """
     identificadores = []
-    tipo_id = "Composto"
     
-    # 1. Busca o "Pai": Número da Negociação
-    # Procura especificamente pelo rótulo "Número da Negociação" ou "Negociação"
+    # Busca Negociação (Aceita "Negociação" ou "Negoc")
     match_neg = re.search(r"(?:Número da Negociação|Negociaç[ãa]o)[:\s№º\.]*(\d{1,15})(?!\d)", text, re.IGNORECASE)
     negociacao = match_neg.group(1) if match_neg else None
 
-    # 2. Busca os "Filhos": Inscrições em Dívida Ativa (Padrão 11 7 11...)
-    # Regex para capturar formato DAU (ex: 11 4 15 000159-24)
+    # Busca Inscrições (Padrão 11 7 11...)
     inscricoes = re.findall(r"(\d{2}\s*\d\s*\d{2}\s*\d{6}[-\s]\d{2})", text)
-    
-    # Limpa e deduplica inscrições
     inscricoes = sorted(list(set([i.replace("\n", " ").strip() for i in inscricoes])))
     
-    # Monta a string final
     partes = []
-    
-    if negociacao:
-        partes.append(f"Negoc: {negociacao}")
+    if negociacao: partes.append(f"Negoc: {negociacao}")
     
     if inscricoes:
-        # Se tiver muitas inscrições, mostra as primeiras 3 e põe reticências
         lista_str = ", ".join(inscricoes[:3])
-        if len(inscricoes) > 3:
-            lista_str += "..."
+        if len(inscricoes) > 3: lista_str += "..."
         partes.append(f"Insc: {lista_str}")
     
-    # 3. Fallback: Se não achou Negociação nem Inscrição DAU, tenta identificador genérico
     if not partes:
         match_gen = re.search(r"(?:Conta|Parcelamento).*?[:\.]\s*(\d+)", text, re.IGNORECASE)
-        if match_gen:
-            partes.append(f"ID: {match_gen.group(1)}")
-            tipo_id = "Genérico"
-        else:
-            return "Desconhecido", "-"
+        if match_gen: partes.append(f"ID: {match_gen.group(1)}")
+        else: return "Desconhecido", "-"
 
-    return " | ".join(partes), tipo_id
+    return " | ".join(partes), "Composto"
 
 def inferir_modalidade(text, raw_modalidade=""):
     if raw_modalidade:
         raw_modalidade = raw_modalidade.replace("\n", " ").strip()
         raw_modalidade = re.split(r"(?:Data|Situa|Valor|N[º°])", raw_modalidade, flags=re.IGNORECASE)[0]
-        # Remove lixo numérico inicial
         raw_modalidade = re.sub(r"^\d{5,}.*?-\s*", "", raw_modalidade) 
     
     if len(raw_modalidade) < 5 or "TIPO DE" in raw_modalidade.upper():
         raw_modalidade = ""
     
-    if len(raw_modalidade) > 10:
-        return raw_modalidade.strip()
+    if len(raw_modalidade) > 10: return raw_modalidade.strip()
 
     upper = text.upper()
     mapa = {
@@ -148,7 +152,6 @@ def processar(uploaded_file):
         with st.status(f"Processando {filename}...", expanded=True):
             full_text = aplicar_ocr(pdf_bytes)
     
-    # Nova função de identificação composta
     identificador, tipo_id = extrair_identificadores_completos(full_text)
     saldo, metodo_saldo = encontrar_saldo_blindado(full_text)
     
@@ -157,15 +160,15 @@ def processar(uploaded_file):
     
     return {
         "Arquivo": filename,
-        "Identificador (Processo/Negociação)": identificador,
+        "Identificador": identificador,
         "Modalidade": modalidade_final,
         "Saldo (R$)": saldo,
         "Método Leitura": metodo
     }
 
 # --- INTERFACE ---
-st.title("📝 Extrator PGFN Detalhado")
-st.markdown("Extrai **Negociação** e **Débitos Inclusos** no mesmo campo.")
+st.title("⭐ Extrator PGFN 10.0 (Final)")
+st.markdown("Extração calibrada para priorizar 'Saldo Devedor com Juros' e Negociações.")
 
 arquivos = st.file_uploader("Arraste seus PDFs", type=["pdf"], accept_multiple_files=True)
 
@@ -182,7 +185,6 @@ if arquivos:
         df = pd.DataFrame(dados)
         st.success("Pronto!")
         
-        # Exibe com largura total
         st.dataframe(df.style.format({"Saldo (R$)": "R$ {:,.2f}"}), use_container_width=True)
         st.metric("Total", f"R$ {df['Saldo (R$)'].sum():,.2f}")
         
@@ -190,8 +192,8 @@ if arquivos:
         with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
             df.to_excel(writer, index=False)
             ws = writer.sheets['Sheet1']
-            ws.set_column('B:B', 50) # Coluna Identificador (Larga para caber tudo)
-            ws.set_column('C:C', 40) # Coluna Modalidade
-            ws.set_column('D:D', 18) # Saldo
+            ws.set_column('B:B', 50)
+            ws.set_column('C:C', 40)
+            ws.set_column('D:D', 18)
             
-        st.download_button("Baixar Excel", buffer.getvalue(), f"PGFN_Detalhado_{datetime.now().strftime('%H%M')}.xlsx")
+        st.download_button("Baixar Excel", buffer.getvalue(), f"PGFN_Final_{datetime.now().strftime('%H%M')}.xlsx")
