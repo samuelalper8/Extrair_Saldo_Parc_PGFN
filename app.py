@@ -9,7 +9,7 @@ from datetime import datetime
 from PIL import Image
 
 # --- CONFIGURAÇÃO ---
-st.set_page_config(page_title="Extrator PGFN Refinado", page_icon="💎", layout="wide")
+st.set_page_config(page_title="Extrator PGFN Detalhado", page_icon="📝", layout="wide")
 
 # --- FUNÇÕES ---
 
@@ -41,42 +41,55 @@ def encontrar_saldo_blindado(text):
     if cand: return max(cand, key=lambda item: item[0])
     return 0.0, "Não encontrado"
 
-def extrair_identificador_inteligente(text):
-    """Refina identificador para evitar códigos de barras."""
+def extrair_identificadores_completos(text):
+    """
+    Captura TANTO a Negociação QUANTO as Inscrições/Débitos inclusos.
+    """
+    identificadores = []
+    tipo_id = "Composto"
     
-    # 1. Negociação Padrão (7 a 9 dígitos isolados)
-    # Evita pegar sequências longas de código de barras
-    match_neg = re.findall(r"(?:Negoc|Parcel|Conta).*?(\d{7,9})(?!\d)", text, re.IGNORECASE)
-    if match_neg:
-        # Pega o primeiro que parecer válido (não é data 2024...)
-        for m in match_neg:
-            if not m.startswith("202"): return m, "Negociação (7-9 dig)"
+    # 1. Busca o "Pai": Número da Negociação
+    # Procura especificamente pelo rótulo "Número da Negociação" ou "Negociação"
+    match_neg = re.search(r"(?:Número da Negociação|Negociaç[ãa]o)[:\s№º\.]*(\d{1,15})(?!\d)", text, re.IGNORECASE)
+    negociacao = match_neg.group(1) if match_neg else None
 
-    # 2. Inscrição Padrão (11 7 11...) com formatação
-    match_insc = re.search(r"(\d{2}\s*\d\s*\d{2}\s*\d{6}[-\s]\d{2})", text)
-    if match_insc: return match_insc.group(1).replace("\n", ""), "Inscrição"
+    # 2. Busca os "Filhos": Inscrições em Dívida Ativa (Padrão 11 7 11...)
+    # Regex para capturar formato DAU (ex: 11 4 15 000159-24)
+    inscricoes = re.findall(r"(\d{2}\s*\d\s*\d{2}\s*\d{6}[-\s]\d{2})", text)
+    
+    # Limpa e deduplica inscrições
+    inscricoes = sorted(list(set([i.replace("\n", " ").strip() for i in inscricoes])))
+    
+    # Monta a string final
+    partes = []
+    
+    if negociacao:
+        partes.append(f"Negoc: {negociacao}")
+    
+    if inscricoes:
+        # Se tiver muitas inscrições, mostra as primeiras 3 e põe reticências
+        lista_str = ", ".join(inscricoes[:3])
+        if len(inscricoes) > 3:
+            lista_str += "..."
+        partes.append(f"Insc: {lista_str}")
+    
+    # 3. Fallback: Se não achou Negociação nem Inscrição DAU, tenta identificador genérico
+    if not partes:
+        match_gen = re.search(r"(?:Conta|Parcelamento).*?[:\.]\s*(\d+)", text, re.IGNORECASE)
+        if match_gen:
+            partes.append(f"ID: {match_gen.group(1)}")
+            tipo_id = "Genérico"
+        else:
+            return "Desconhecido", "-"
 
-    # 3. Fallback: Procura número menor após "Negociação"
-    match_curto = re.search(r"Negocia.*?\s(\d{1,8})\b", text, re.IGNORECASE)
-    if match_curto: return match_curto.group(1), "Negociação (Curta)"
-
-    return "Desconhecido", "-"
-
-def limpar_modalidade(texto_modalidade):
-    """Remove lixo numérico do início da modalidade."""
-    if not texto_modalidade: return ""
-    # Remove sequências longas de zeros ou números no início que parecem recibo
-    # Ex: "00000987246717 COM ATRASO..." -> "COM ATRASO..."
-    clean = re.sub(r"^\d{10,}\s*", "", texto_modalidade)
-    # Se sobrou "0039 - ...", mantém, pois é código da receita
-    return clean.strip()
+    return " | ".join(partes), tipo_id
 
 def inferir_modalidade(text, raw_modalidade=""):
-    # Limpeza prévia
     if raw_modalidade:
         raw_modalidade = raw_modalidade.replace("\n", " ").strip()
         raw_modalidade = re.split(r"(?:Data|Situa|Valor|N[º°])", raw_modalidade, flags=re.IGNORECASE)[0]
-        raw_modalidade = limpar_modalidade(raw_modalidade)
+        # Remove lixo numérico inicial
+        raw_modalidade = re.sub(r"^\d{5,}.*?-\s*", "", raw_modalidade) 
     
     if len(raw_modalidade) < 5 or "TIPO DE" in raw_modalidade.upper():
         raw_modalidade = ""
@@ -135,7 +148,8 @@ def processar(uploaded_file):
         with st.status(f"Processando {filename}...", expanded=True):
             full_text = aplicar_ocr(pdf_bytes)
     
-    identificador, tipo_id = extrair_identificador_inteligente(full_text)
+    # Nova função de identificação composta
+    identificador, tipo_id = extrair_identificadores_completos(full_text)
     saldo, metodo_saldo = encontrar_saldo_blindado(full_text)
     
     raw_mod = extrair_modalidade_multilinha(full_text)
@@ -143,15 +157,15 @@ def processar(uploaded_file):
     
     return {
         "Arquivo": filename,
-        "Identificador": identificador,
+        "Identificador (Processo/Negociação)": identificador,
         "Modalidade": modalidade_final,
         "Saldo (R$)": saldo,
         "Método Leitura": metodo
     }
 
 # --- INTERFACE ---
-st.title("💎 Extrator PGFN Refinado")
-st.markdown("Filtro inteligente de identificadores para evitar números de códigos de barras.")
+st.title("📝 Extrator PGFN Detalhado")
+st.markdown("Extrai **Negociação** e **Débitos Inclusos** no mesmo campo.")
 
 arquivos = st.file_uploader("Arraste seus PDFs", type=["pdf"], accept_multiple_files=True)
 
@@ -168,6 +182,7 @@ if arquivos:
         df = pd.DataFrame(dados)
         st.success("Pronto!")
         
+        # Exibe com largura total
         st.dataframe(df.style.format({"Saldo (R$)": "R$ {:,.2f}"}), use_container_width=True)
         st.metric("Total", f"R$ {df['Saldo (R$)'].sum():,.2f}")
         
@@ -175,7 +190,8 @@ if arquivos:
         with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
             df.to_excel(writer, index=False)
             ws = writer.sheets['Sheet1']
-            ws.set_column('C:C', 50)
-            ws.set_column('D:D', 18)
+            ws.set_column('B:B', 50) # Coluna Identificador (Larga para caber tudo)
+            ws.set_column('C:C', 40) # Coluna Modalidade
+            ws.set_column('D:D', 18) # Saldo
             
-        st.download_button("Baixar Excel", buffer.getvalue(), f"PGFN_Refinado_{datetime.now().strftime('%H%M')}.xlsx")
+        st.download_button("Baixar Excel", buffer.getvalue(), f"PGFN_Detalhado_{datetime.now().strftime('%H%M')}.xlsx")
